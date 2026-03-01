@@ -62,8 +62,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "quando si liberano nuovi posti nei turni esauriti!\n\n"
         "📌 *Comandi disponibili:*\n"
         "Invia un link di Eventbrite per iniziare a monitorarlo.\n"
-        "/list - Mostra i siti che stai monitorando\n"
-        "/remove <id> - Rimuovi un sito dal monitoraggio"
+        "/list - Mostra i siti che stai monitorando e ti permette di rimuoverli."
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
 
@@ -83,20 +82,23 @@ async def list_monitors(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     text = "📋 *I tuoi monitoraggi:*\n\n"
     for mid, m_data in user_monitors:
         text += f"🔹 *{m_data['name']}*\n"
-        text += f"ID: `{mid}`\n"
-        text += f"🔗 [Link]({m_data['url']})\n\n"
+        text += f"🔗 [Link]({m_data['url']})\n"
+        text += f"❌ Disattiva: /remove\_{mid}\n\n"
         
-    text += "Usa `/remove <ID>` per rimuoverne uno."
     await update.message.reply_text(text, parse_mode="Markdown", disable_web_page_preview=True)
 
 async def remove_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     
-    if not context.args:
-        await update.message.reply_text("⚠️ Specifica l'ID da rimuovere. Esempio: `/remove 1974872659286`", parse_mode="Markdown")
+    # Extract ID from the command (e.g. /remove_1974872659286)
+    command_text = update.message.text
+    match = re.search(r'/remove_(\d+)', command_text)
+    
+    if not match:
+        await update.message.reply_text("⚠️ Comando non valido. Clicca sui link generati da /list per rimuovere un monitoraggio.", parse_mode="Markdown")
         return
         
-    target_id = context.args[0]
+    target_id = match.group(1)
     db = load_db()
     
     if target_id not in db["monitors"] or chat_id not in db["monitors"][target_id].get("subscribers", []):
@@ -350,7 +352,8 @@ def main():
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("list", list_monitors))
-    application.add_handler(CommandHandler("remove", remove_monitor))
+    # Aggiungi handler regex per comandi dinamici come /remove_123456
+    application.add_handler(MessageHandler(filters.Regex(r'^/remove_\d+$'), remove_monitor))
     
     # Ascolta qualsiasi messaggio di testo per cercare link
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
