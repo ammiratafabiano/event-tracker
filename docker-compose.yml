@@ -2,9 +2,13 @@ version: "3.8"
 
 services:
   event-tracker:
-    build: .
+    # L'immagine adesso verrà scaricata dal tuo registro GitHub!
+    image: ghcr.io/ammiratafabiano/event-tracker:latest
     container_name: event-tracker
     restart: unless-stopped
     volumes:
       - ./config.json:/app/config.json
       - ./db.json:/app/db.json
+    labels:
+      # Diciamo a watchtower di aggiornare questo container in automatico
+      - "com.centurylinklabs.watchtower.enable=true"
