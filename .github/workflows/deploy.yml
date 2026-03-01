@@ -1,0 +1,29 @@
+name: Deploy Event Tracker to Raspberry Pi
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Create Example Config/DB if not present
+        run: |
+          if [ ! -f config.json ]; then
+            cp config.json.example config.json
+          fi
+          if [ ! -f db.json ]; then
+            echo '{"monitors": {}}' > db.json
+          fi
+
+      - name: Deploy using Docker Compose
+        run: |
+          docker compose up -d --build
+          docker image prune -f
