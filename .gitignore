@@ -1,0 +1,6 @@
+venv/
+config.json
+db.json
+__pycache__/
+*.pyc
+
