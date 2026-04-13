@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import re
@@ -37,6 +38,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Prada Frames 2026 – Web Page Monitor
+# ---------------------------------------------------------------------------
+PRADA_URL = "https://www.prada.com/it/it/pradasphere/events/2026/prada-frames-milan.html"
+PRADA_CHECK_INTERVAL = 15 * 60  # ogni 15 minuti
+
+# ---------------------------------------------------------------------------
 # Database Management
 # ---------------------------------------------------------------------------
 def load_db() -> Dict[str, Any]:
@@ -62,7 +69,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "quando si liberano nuovi posti nei turni esauriti!\n\n"
         "📌 *Comandi disponibili:*\n"
         "Invia un link di Eventbrite per iniziare a monitorarlo.\n"
-        "/list - Mostra i siti che stai monitorando e ti permette di rimuoverli."
+        "/list - Mostra i siti che stai monitorando e ti permette di rimuoverli.\n"
+        "/prada - Attiva/disattiva notifica apertura iscrizioni Prada Frames 2026."
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
 
@@ -181,6 +189,112 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 # ---------------------------------------------------------------------------
 # Background Checking Logic
 # ---------------------------------------------------------------------------
+
+# -- Prada Frames web page monitor --
+
+def get_prada_page_hash() -> str | None:
+    """Fetch la pagina Prada Frames e ritorna un hash del contenuto principale."""
+    try:
+        session = requests.Session()
+        session.headers.update({"User-Agent": USER_AGENT})
+        resp = session.get(PRADA_URL, timeout=20)
+        resp.raise_for_status()
+        html = resp.text
+
+        # Estrai solo il contenuto principale, ignora script/style/nonce che cambiano ad ogni request
+        html = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL)
+        html = re.sub(r'<style[^>]*>.*?</style>', '', html, flags=re.DOTALL)
+        html = re.sub(r'<!--.*?-->', '', html, flags=re.DOTALL)
+        # Rimuovi attributi dinamici (nonce, csrf, timestamp)
+        html = re.sub(r'\s(?:nonce|data-nonce|csrf|data-timestamp)=["\'][^"\']*["\']', '', html)
+        # Normalizza spazi
+        html = re.sub(r'\s+', ' ', html).strip()
+
+        return hashlib.sha256(html.encode('utf-8')).hexdigest()
+    except Exception as e:
+        logger.error(f"Errore controllo pagina Prada Frames: {e}")
+        return None
+
+
+async def prada_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Toggle iscrizione al monitoraggio Prada Frames."""
+    chat_id = update.effective_chat.id
+    db = load_db()
+    subs = db.setdefault("prada_subscribers", [])
+
+    if chat_id in subs:
+        subs.remove(chat_id)
+        save_db(db)
+        await update.message.reply_text("❌ Monitoraggio Prada Frames rimosso.")
+    else:
+        subs.append(chat_id)
+        save_db(db)
+        await update.message.reply_text(
+            "✅ Ti avviserò quando la pagina *Prada Frames* viene modificata!\n\n"
+            f"🔗 [Pagina evento]({PRADA_URL})",
+            parse_mode="Markdown",
+            disable_web_page_preview=True
+        )
+
+
+async def bg_prada_check(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Controllo periodico iscrizioni Prada Frames."""
+    now = datetime.now()
+
+    # Dopo il 21 aprile 2026 non serve più controllare
+    if now > datetime(2026, 4, 21, 23, 59):
+        logger.info("Prada Frames: evento concluso, skip.")
+        return
+
+    # Orario notturno: skip
+    if now.hour >= 23 or now.hour < 7:
+        logger.info("Prada Frames: orario notturno, skip.")
+        return
+
+    db = load_db()
+    subscribers = db.get("prada_subscribers", [])
+    if not subscribers:
+        return
+
+    logger.info("Controllo pagina Prada Frames...")
+    current_hash = get_prada_page_hash()
+
+    if current_hash is None:
+        return
+
+    prev_hash = db.get("prada_page_hash")
+    if prev_hash is None:
+        # Primo controllo: salva l'hash iniziale senza notificare
+        db["prada_page_hash"] = current_hash
+        save_db(db)
+        logger.info(f"Prada Frames: hash iniziale salvato ({current_hash[:12]}…)")
+        return
+
+    if current_hash != prev_hash:
+        logger.info(f"🔔 Pagina Prada Frames modificata! ({prev_hash[:12]}… → {current_hash[:12]}…)")
+        db["prada_page_hash"] = current_hash
+        save_db(db)
+
+        msg = (
+            "🔔 *La pagina Prada Frames è stata aggiornata!*\n\n"
+            "Controlla se sono aperte le iscrizioni:\n"
+            f"👉 [Vai alla pagina]({PRADA_URL})"
+        )
+        for sub in subscribers:
+            try:
+                await context.bot.send_message(
+                    chat_id=sub,
+                    text=msg,
+                    parse_mode="Markdown",
+                    disable_web_page_preview=True
+                )
+            except Exception as e:
+                logger.error(f"Errore notifica Prada a {sub}: {e}")
+    else:
+        logger.info("Prada Frames: nessuna modifica.")
+
+
+# -- Eventbrite monitors --
 def check_event_series(series_id: str) -> List[Dict]:
     events = []
     url = f"{API_BASE}/series/{series_id}/events/?time_filter=current_future&page_size=50&expand=ticket_availability"
@@ -352,6 +466,7 @@ def main():
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("list", list_monitors))
+    application.add_handler(CommandHandler("prada", prada_command))
     # Aggiungi handler regex per comandi dinamici come /remove_123456
     application.add_handler(MessageHandler(filters.Regex(r'^/remove_\d+$'), remove_monitor))
     
@@ -365,6 +480,9 @@ def main():
     job_queue = application.job_queue
     # Partiamo in ritardo di 10 secondi, e poi cicliamo
     job_queue.run_repeating(bg_check_job, interval=interval_seconds, first=10)
+
+    # Prada Frames: check ogni 15 minuti (attivo fino al 21/04/2026)
+    job_queue.run_repeating(bg_prada_check, interval=PRADA_CHECK_INTERVAL, first=30)
     
     logger.info("🤖 Event Tracker Bot avviato. In attesa di messaggi...")
     application.run_polling()
