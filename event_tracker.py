@@ -6,7 +6,7 @@ import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 import requests
 from telegram import Update
@@ -192,7 +192,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 # -- Prada Frames web page monitor --
 
-def get_prada_page_hash() -> str | None:
+def get_prada_page_hash() -> Optional[str]:
     """Fetch la pagina Prada Frames e ritorna un hash del contenuto principale."""
     try:
         session = requests.Session()
