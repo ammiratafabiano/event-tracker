@@ -38,10 +38,26 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Prada Frames 2026 – Web Page Monitor
+# Page Watchers – monitoraggio modifiche pagine web
 # ---------------------------------------------------------------------------
-PRADA_URL = "https://www.prada.com/it/it/pradasphere/events/2026/prada-frames-milan.html"
-PRADA_CHECK_INTERVAL = 15 * 60  # ogni 15 minuti
+PAGE_CHECK_INTERVAL = 15 * 60  # ogni 15 minuti
+
+# Ogni watcher ha: id (usato come comando e chiave db), nome, url, scadenza
+PAGE_WATCHERS = [
+    {
+        "id": "prada",
+        "name": "Prada Frames 2026",
+        "url": "https://www.prada.com/it/it/pradasphere/events/2026/prada-frames-milan.html",
+        "expires": datetime(2026, 4, 21, 23, 59),
+    },
+    {
+        "id": "furla",
+        "name": "Furla Design Week",
+        "url": "https://www.furla.com/it/it/eshop/collections/design-week/",
+        "expires": datetime(2026, 4, 21, 23, 59),
+    },
+]
+PAGE_WATCHERS_BY_ID = {w["id"]: w for w in PAGE_WATCHERS}
 
 # ---------------------------------------------------------------------------
 # Database Management
@@ -50,10 +66,18 @@ def load_db() -> Dict[str, Any]:
     if DB_FILE.exists():
         try:
             with open(DB_FILE, "r") as f:
-                return json.load(f)
+                db = json.load(f)
         except json.JSONDecodeError:
             return {"monitors": {}}
-    return {"monitors": {}}
+    else:
+        return {"monitors": {}}
+    # Migrazione: vecchie chiavi prada_subscribers/prada_page_hash -> nuovo formato
+    if "prada_subscribers" in db:
+        db["page_watch_prada_subscribers"] = db.pop("prada_subscribers")
+    if "prada_page_hash" in db:
+        db["page_watch_prada_hash"] = db.pop("prada_page_hash")
+    db.pop("prada_notified", None)
+    return db
 
 def save_db(db: Dict[str, Any]) -> None:
     with open(DB_FILE, "w") as f:
@@ -70,7 +94,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "📌 *Comandi disponibili:*\n"
         "Invia un link di Eventbrite per iniziare a monitorarlo.\n"
         "/list - Mostra i siti che stai monitorando e ti permette di rimuoverli.\n"
-        "/prada - Attiva/disattiva notifica apertura iscrizioni Prada Frames 2026."
+        + "\n".join(f"/{w['id']} - Notifica modifiche pagina {w['name']}." for w in PAGE_WATCHERS)
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
 
@@ -190,14 +214,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 # Background Checking Logic
 # ---------------------------------------------------------------------------
 
-# -- Prada Frames web page monitor --
+# -- Page watchers: monitoraggio modifiche pagine web --
 
-def get_prada_page_hash() -> Optional[str]:
-    """Fetch la pagina Prada Frames e ritorna un hash del contenuto principale."""
+def get_page_hash(url: str) -> Optional[str]:
+    """Fetch una pagina web e ritorna un hash del contenuto principale."""
     try:
         session = requests.Session()
         session.headers.update({"User-Agent": USER_AGENT})
-        resp = session.get(PRADA_URL, timeout=20)
+        resp = session.get(url, timeout=20)
         resp.raise_for_status()
         html = resp.text
 
@@ -212,86 +236,103 @@ def get_prada_page_hash() -> Optional[str]:
 
         return hashlib.sha256(html.encode('utf-8')).hexdigest()
     except Exception as e:
-        logger.error(f"Errore controllo pagina Prada Frames: {e}")
+        logger.error(f"Errore controllo pagina {url}: {e}")
         return None
 
 
-async def prada_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Toggle iscrizione al monitoraggio Prada Frames."""
+async def page_watch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Toggle iscrizione al monitoraggio di una pagina. Il watcher_id viene dal comando."""
+    command = update.message.text.strip().lstrip('/')
+    watcher = PAGE_WATCHERS_BY_ID.get(command)
+    if not watcher:
+        await update.message.reply_text("⚠️ Comando non riconosciuto.")
+        return
+
     chat_id = update.effective_chat.id
     db = load_db()
-    subs = db.setdefault("prada_subscribers", [])
+    db_key = f"page_watch_{watcher['id']}_subscribers"
+    subs = db.setdefault(db_key, [])
 
     if chat_id in subs:
         subs.remove(chat_id)
         save_db(db)
-        await update.message.reply_text("❌ Monitoraggio Prada Frames rimosso.")
+        await update.message.reply_text(f"❌ Monitoraggio *{watcher['name']}* rimosso.", parse_mode="Markdown")
     else:
         subs.append(chat_id)
         save_db(db)
         await update.message.reply_text(
-            "✅ Ti avviserò quando la pagina *Prada Frames* viene modificata!\n\n"
-            f"🔗 [Pagina evento]({PRADA_URL})",
+            f"✅ Ti avviserò quando la pagina *{watcher['name']}* viene modificata!\n\n"
+            f"🔗 [Pagina]({watcher['url']})",
             parse_mode="Markdown",
             disable_web_page_preview=True
         )
 
 
-async def bg_prada_check(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Controllo periodico iscrizioni Prada Frames."""
+async def bg_page_watch_check(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Controllo periodico di tutte le pagine monitorate."""
     now = datetime.now()
-
-    # Dopo il 21 aprile 2026 non serve più controllare
-    if now > datetime(2026, 4, 21, 23, 59):
-        logger.info("Prada Frames: evento concluso, skip.")
-        return
 
     # Orario notturno: skip
     if now.hour >= 23 or now.hour < 7:
-        logger.info("Prada Frames: orario notturno, skip.")
+        logger.info("Page watchers: orario notturno, skip.")
         return
 
     db = load_db()
-    subscribers = db.get("prada_subscribers", [])
-    if not subscribers:
-        return
+    modifications = False
 
-    logger.info("Controllo pagina Prada Frames...")
-    current_hash = get_prada_page_hash()
+    for watcher in PAGE_WATCHERS:
+        wid = watcher["id"]
 
-    if current_hash is None:
-        return
+        # Scaduto?
+        if now > watcher["expires"]:
+            continue
 
-    prev_hash = db.get("prada_page_hash")
-    if prev_hash is None:
-        # Primo controllo: salva l'hash iniziale senza notificare
-        db["prada_page_hash"] = current_hash
+        db_key = f"page_watch_{wid}_subscribers"
+        subscribers = db.get(db_key, [])
+        if not subscribers:
+            continue
+
+        logger.info(f"Controllo pagina {watcher['name']}...")
+        current_hash = get_page_hash(watcher["url"])
+
+        if current_hash is None:
+            continue
+
+        hash_key = f"page_watch_{wid}_hash"
+        prev_hash = db.get(hash_key)
+        if prev_hash is None:
+            # Primo controllo: salva l'hash iniziale senza notificare
+            db[hash_key] = current_hash
+            modifications = True
+            logger.info(f"{watcher['name']}: hash iniziale salvato ({current_hash[:12]}…)")
+            continue
+
+        if current_hash != prev_hash:
+            logger.info(f"🔔 Pagina {watcher['name']} modificata! ({prev_hash[:12]}… → {current_hash[:12]}…)")
+            db[hash_key] = current_hash
+            modifications = True
+
+            msg = (
+                f"🔔 *La pagina {watcher['name']} è stata aggiornata!*\n\n"
+                f"👉 [Vai alla pagina]({watcher['url']})"
+            )
+            for sub in subscribers:
+                try:
+                    await context.bot.send_message(
+                        chat_id=sub,
+                        text=msg,
+                        parse_mode="Markdown",
+                        disable_web_page_preview=True
+                    )
+                except Exception as e:
+                    logger.error(f"Errore notifica {watcher['name']} a {sub}: {e}")
+        else:
+            logger.info(f"{watcher['name']}: nessuna modifica.")
+
+        time.sleep(2)
+
+    if modifications:
         save_db(db)
-        logger.info(f"Prada Frames: hash iniziale salvato ({current_hash[:12]}…)")
-        return
-
-    if current_hash != prev_hash:
-        logger.info(f"🔔 Pagina Prada Frames modificata! ({prev_hash[:12]}… → {current_hash[:12]}…)")
-        db["prada_page_hash"] = current_hash
-        save_db(db)
-
-        msg = (
-            "🔔 *La pagina Prada Frames è stata aggiornata!*\n\n"
-            "Controlla se sono aperte le iscrizioni:\n"
-            f"👉 [Vai alla pagina]({PRADA_URL})"
-        )
-        for sub in subscribers:
-            try:
-                await context.bot.send_message(
-                    chat_id=sub,
-                    text=msg,
-                    parse_mode="Markdown",
-                    disable_web_page_preview=True
-                )
-            except Exception as e:
-                logger.error(f"Errore notifica Prada a {sub}: {e}")
-    else:
-        logger.info("Prada Frames: nessuna modifica.")
 
 
 # -- Eventbrite monitors --
@@ -466,7 +507,9 @@ def main():
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("list", list_monitors))
-    application.add_handler(CommandHandler("prada", prada_command))
+    # Comandi per page watchers (prada, furla, ...)
+    for w in PAGE_WATCHERS:
+        application.add_handler(CommandHandler(w["id"], page_watch_command))
     # Aggiungi handler regex per comandi dinamici come /remove_123456
     application.add_handler(MessageHandler(filters.Regex(r'^/remove_\d+$'), remove_monitor))
     
@@ -481,8 +524,8 @@ def main():
     # Partiamo in ritardo di 10 secondi, e poi cicliamo
     job_queue.run_repeating(bg_check_job, interval=interval_seconds, first=10)
 
-    # Prada Frames: check ogni 15 minuti (attivo fino al 21/04/2026)
-    job_queue.run_repeating(bg_prada_check, interval=PRADA_CHECK_INTERVAL, first=30)
+    # Page watchers: check ogni 15 minuti (attivo fino alla scadenza di ciascun watcher)
+    job_queue.run_repeating(bg_page_watch_check, interval=PAGE_CHECK_INTERVAL, first=30)
     
     logger.info("🤖 Event Tracker Bot avviato. In attesa di messaggi...")
     application.run_polling()
