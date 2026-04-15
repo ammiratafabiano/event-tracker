@@ -35,6 +35,24 @@ EVENTBRITE_DOMAINS = {"eventbrite.it", "eventbrite.com", "www.eventbrite.it", "w
 
 PAGE_CHECK_INTERVAL = 15 * 60  # ogni 15 minuti
 
+# Sessioni HTTP riutilizzate tra le chiamate (evita overhead TLS/handshake)
+_http_session: Optional[requests.Session] = None
+_eventbrite_session: Optional[requests.Session] = None
+
+def _get_http_session() -> requests.Session:
+    global _http_session
+    if _http_session is None:
+        _http_session = requests.Session()
+        _http_session.headers.update({"User-Agent": USER_AGENT})
+    return _http_session
+
+def _get_eventbrite_session() -> requests.Session:
+    global _eventbrite_session
+    if _eventbrite_session is None:
+        _eventbrite_session = requests.Session()
+        _eventbrite_session.headers.update({"User-Agent": USER_AGENT})
+    return _eventbrite_session
+
 # Shortcut commands: pagine preconfigurate attivabili con /<id>
 PAGE_SHORTCUTS = [
     {
@@ -294,8 +312,7 @@ async def _handle_eventbrite(update: Update, context: ContextTypes.DEFAULT_TYPE,
     await update.message.reply_text("🔍 Controllo l'evento, un attimo...")
 
     try:
-        session = requests.Session()
-        session.headers.update({"User-Agent": USER_AGENT})
+        session = _get_eventbrite_session()
         resp = session.get(f"{API_BASE}/destination/events/?event_ids={event_id}", timeout=15)
         resp.raise_for_status()
 
@@ -353,8 +370,7 @@ async def _handle_eventbrite(update: Update, context: ContextTypes.DEFAULT_TYPE,
 def get_page_hash(url: str) -> Optional[str]:
     """Fetch una pagina web e ritorna un hash del contenuto principale."""
     try:
-        session = requests.Session()
-        session.headers.update({"User-Agent": USER_AGENT})
+        session = _get_http_session()
         resp = session.get(url, timeout=20)
         resp.raise_for_status()
         html = resp.text
@@ -436,8 +452,7 @@ async def bg_page_watch_check(context: ContextTypes.DEFAULT_TYPE) -> None:
 def check_event_series(series_id: str) -> List[Dict]:
     events = []
     url = f"{API_BASE}/series/{series_id}/events/?time_filter=current_future&page_size=50&expand=ticket_availability"
-    session = requests.Session()
-    session.headers.update({"User-Agent": USER_AGENT})
+    session = _get_eventbrite_session()
 
     while url:
         try:
@@ -472,8 +487,7 @@ def check_event_series(series_id: str) -> List[Dict]:
 
 def check_single_event(event_id: str) -> List[Dict]:
     try:
-        session = requests.Session()
-        session.headers.update({"User-Agent": USER_AGENT})
+        session = _get_eventbrite_session()
         resp = session.get(f"{API_BASE}/destination/events/?event_ids={event_id}&expand=ticket_availability", timeout=15)
         resp.raise_for_status()
         data = resp.json()
@@ -522,6 +536,7 @@ async def bg_check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             results = check_event_series(mid)
         else:
             results = check_single_event(mid)
+        time.sleep(3)
             
         # Analizziamo i risultati e mandiamo notifiche se qualcosa è tornato disponibile
         states = m_data.get("events_state", {})
