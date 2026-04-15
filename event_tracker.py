@@ -442,7 +442,7 @@ async def bg_page_watch_check(context: ContextTypes.DEFAULT_TYPE) -> None:
         else:
             logger.info(f"{name}: nessuna modifica.")
 
-        time.sleep(2)
+        await asyncio.sleep(2)
 
     if modifications:
         save_db(db)
@@ -536,7 +536,7 @@ async def bg_check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             results = check_event_series(mid)
         else:
             results = check_single_event(mid)
-        time.sleep(3)
+        await asyncio.sleep(3)
             
         # Analizziamo i risultati e mandiamo notifiche se qualcosa è tornato disponibile
         states = m_data.get("events_state", {})
@@ -592,7 +592,7 @@ async def bg_check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         m_data["events_state"] = states
         
         # Facciamo una piccola pausa tra le chiamate per non esagerare se abbiamo molti monitoraggi
-        time.sleep(2)
+        await asyncio.sleep(2)
         
     if modifications:
         save_db(db)
