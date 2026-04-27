@@ -4,6 +4,7 @@ import logging
 import re
 import os
 import time
+import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any, List, Optional
@@ -53,20 +54,9 @@ def _get_eventbrite_session() -> requests.Session:
         _eventbrite_session.headers.update({"User-Agent": USER_AGENT})
     return _eventbrite_session
 
-# Shortcut commands: pagine preconfigurate attivabili con /<id>
-PAGE_SHORTCUTS = [
-    {
-        "id": "prada",
-        "name": "Prada Frames 2026",
-        "url": "https://www.prada.com/it/it/pradasphere/events/2026/prada-frames-milan.html",
-    },
-    {
-        "id": "furla",
-        "name": "Furla Design Week",
-        "url": "https://www.furla.com/it/it/eshop/collections/design-week/",
-    },
-]
-PAGE_SHORTCUTS_BY_ID = {s["id"]: s for s in PAGE_SHORTCUTS}
+# Shortcut commands (removed)
+PAGE_SHORTCUTS = []
+PAGE_SHORTCUTS_BY_ID = {}
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -89,29 +79,7 @@ def load_db() -> Dict[str, Any]:
 
     db.setdefault("monitors", {})
 
-    # Migrazione: vecchie chiavi page_watch_*_subscribers -> monitors unificati
     migrated = False
-    for shortcut in PAGE_SHORTCUTS:
-        old_subs_key = f"page_watch_{shortcut['id']}_subscribers"
-        old_hash_key = f"page_watch_{shortcut['id']}_hash"
-        if old_subs_key in db:
-            subs = db.pop(old_subs_key)
-            old_hash = db.pop(old_hash_key, None)
-            mid = _make_page_watcher_id(shortcut["url"])
-            if mid not in db["monitors"]:
-                db["monitors"][mid] = {
-                    "url": shortcut["url"],
-                    "platform": "page_watcher",
-                    "name": shortcut["name"],
-                    "subscribers": subs,
-                }
-                if old_hash:
-                    db["monitors"][mid]["page_hash"] = old_hash
-            else:
-                for s in subs:
-                    if s not in db["monitors"][mid]["subscribers"]:
-                        db["monitors"][mid]["subscribers"].append(s)
-            migrated = True
     # Pulizia vecchie chiavi
     for key in list(db.keys()):
         if key.startswith("prada_") or key.startswith("page_watch_"):
@@ -133,17 +101,13 @@ def _make_page_watcher_id(url: str) -> str:
 # Telegram Bot Handlers
 # ---------------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    shortcut_lines = "\n".join(
-        f"/{s['id']} - Monitora {s['name']}." for s in PAGE_SHORTCUTS
-    )
     welcome_text = (
         "👋 Ciao! Sono Event Tracker.\n\n"
         "Posso monitorare per te pagine web e biglietti Eventbrite!\n\n"
         "📌 *Comandi disponibili:*\n"
         "Invia un *link Eventbrite* → monitoraggio posti liberi.\n"
         "Invia un *qualsiasi altro link* → ti avviso quando la pagina cambia.\n"
-        "/list - Mostra i tuoi monitoraggi e permette di rimuoverli.\n"
-        f"{shortcut_lines}"
+        "/list - Mostra i tuoi monitoraggi e permette di rimuoverli."
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
 
@@ -215,35 +179,6 @@ def _add_page_watcher(db: Dict, chat_id: int, url: str, name: str) -> str:
             db["monitors"][mid]["subscribers"].append(chat_id)
             return "added"
         return "exists"
-
-
-async def page_shortcut_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Gestisce i comandi shortcut (/prada, /furla, ...). Iscrive senza toggle."""
-    command = update.message.text.strip().lstrip('/')
-    shortcut = PAGE_SHORTCUTS_BY_ID.get(command)
-    if not shortcut:
-        await update.message.reply_text("⚠️ Comando non riconosciuto.")
-        return
-
-    chat_id = update.effective_chat.id
-    db = load_db()
-    result = _add_page_watcher(db, chat_id, shortcut["url"], shortcut["name"])
-    save_db(db)
-
-    if result == "exists":
-        await update.message.reply_text(
-            f"ℹ️ Stai già monitorando *{shortcut['name']}*.\n"
-            "Usa /list per gestire i tuoi monitoraggi.",
-            parse_mode="Markdown"
-        )
-    else:
-        await update.message.reply_text(
-            f"✅ Ti avviserò quando la pagina *{shortcut['name']}* viene modificata!\n\n"
-            f"🔗 [Pagina]({shortcut['url']})",
-            parse_mode="Markdown",
-            disable_web_page_preview=True
-        )
-
 
 # ---------------------------------------------------------------------------
 # Handle incoming messages (links)
@@ -621,9 +556,6 @@ def main():
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("list", list_monitors))
-    # Shortcut per page watchers preconfigurati
-    for s in PAGE_SHORTCUTS:
-        application.add_handler(CommandHandler(s["id"], page_shortcut_command))
     # Comandi dinamici /remove_<id>
     application.add_handler(MessageHandler(filters.Regex(r'^/remove_\w+$'), remove_monitor))
     
