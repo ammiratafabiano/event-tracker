@@ -300,6 +300,38 @@ async def _handle_eventbrite(update: Update, context: ContextTypes.DEFAULT_TYPE,
 # Background Checking Logic
 # ---------------------------------------------------------------------------
 
+def verify_tickets_on_web(url: str) -> bool:
+    """Controllo supplementare via scraping HTTP prima di inviare una notifica.
+    Ritorna True solo se la pagina NON indica 'sales ended' o 'sold out'."""
+    try:
+        session = _get_http_session()
+        resp = session.get(url, timeout=12)
+        if resp.status_code != 200:
+            return False
+        html = resp.text
+        html_lower = html.lower()
+        if "ticket sales have ended" in html_lower or "sales ended" in html_lower:
+            logger.info(f"Web verify {url}: trovato 'Sales ended'")
+            return False
+        if "esauriti" in html_lower and "biglietti" in html_lower:
+            logger.info(f"Web verify {url}: trovato 'Biglietti esauriti'")
+            return False
+
+        match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html, re.DOTALL)
+        if match:
+            try:
+                data = json.loads(match.group(1))
+                page_props_str = str(data.get("props", {}).get("pageProps", {})).lower()
+                if "tickets_sold_out" in page_props_str or "'salesstatus': 'sold_out'" in page_props_str or "'salesstatus': 'sales_ended'" in page_props_str:
+                    logger.info(f"Web verify {url}: __NEXT_DATA__ indica sold_out / sales_ended")
+                    return False
+            except Exception as ex:
+                logger.warning(f"Errore parsing __NEXT_DATA__ per {url}: {ex}")
+        return True
+    except Exception as e:
+        logger.error(f"Errore web verification per {url}: {e}")
+        return True
+
 # -- Page watcher hash check --
 
 def get_page_hash(url: str) -> Optional[str]:
@@ -398,12 +430,25 @@ def check_event_series(series_id: str) -> List[Dict]:
             for ev in data.get("events", []):
                 if ev["status"] != "live":
                     continue
+
+                start_iso = ev.get("start", {}).get("local")
+                if start_iso:
+                    try:
+                        dt_start = datetime.fromisoformat(start_iso)
+                        if dt_start < datetime.now():
+                            continue
+                    except Exception:
+                        pass
+
                 tickets_info = ev.get("ticket_availability", {})
-                is_available = tickets_info.get("has_available_tickets", False)
+                has_avail = tickets_info.get("has_available_tickets", False)
+                is_sold_out = tickets_info.get("is_sold_out", False)
+                is_available = has_avail and not is_sold_out
+
                 events.append({
                     "id": ev["id"],
                     "url": ev["url"],
-                    "start": ev["start"]["local"],
+                    "start": start_iso,
                     "is_available": is_available,
                 })
                 
@@ -433,13 +478,23 @@ def check_single_event(event_id: str) -> List[Dict]:
         if ev["status"] != "live":
             return []
             
+        start_iso = ev["start_date"] + "T" + ev.get("start_time", "00:00:00")
+        try:
+            dt_start = datetime.fromisoformat(start_iso)
+            if dt_start < datetime.now():
+                return []
+        except Exception:
+            pass
+
         tickets_info = ev.get("ticket_availability", {})
-        is_available = tickets_info.get("has_available_tickets", False)
+        has_avail = tickets_info.get("has_available_tickets", False)
+        is_sold_out = tickets_info.get("is_sold_out", False)
+        is_available = has_avail and not is_sold_out
         
         return [{
             "id": ev["id"],
             "url": ev["url"],
-            "start": ev["start_date"] + "T" + ev.get("start_time", "00:00:00"),
+            "start": start_iso,
             "is_available": is_available,
         }]
     except Exception as e:
@@ -481,39 +536,38 @@ async def bg_check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             curr_avail = r["is_available"]
             prev_avail = states.get(cid, {}).get("available", None)
             
-            # Se prima non era disponibile (o non era tracciato) e ORA è disponibile -> MANDA NOTIFICA
-            # NOTA: se è il primissimo controllo (prev_avail è None) vogliamo inviare?
-            # Meglio di no: potremmo inondare l'utente con tutti gli eventi disponibili appena mette il link.
-            # Lo inviamo solo se da False diventa True.
-            
             if curr_avail is True and prev_avail is False:
-                # E' diventato disponibile!
-                logger.info(f"🔔 Cambio di stato per {m_data['name']}! Data: {r['start']}")
+                # E' diventato disponibile dall'API -> effettuiamo verfica web finale per evitare false avvisi "Sales ended"
+                logger.info(f"🔔 Cambio di stato per {m_data['name']}! Data: {r['start']} - Effettuo doppia verifica web...")
                 
-                dt = ""
-                try:
-                    dt_obj = datetime.fromisoformat(r["start"])
-                    dt = dt_obj.strftime("%d/%m/%Y %H:%M")
-                except:
-                    dt = r["start"]
-                    
-                msg = (
-                    f"🎉 *Nuovi posti disponibili!*\n\n"
-                    f"🔹 *{m_data['name']}*\n"
-                    f"📅 Data: {dt}\n\n"
-                    f"👉 [Prenota Subito]({r['url']})"
-                )
-                
-                for sub in m_data["subscribers"]:
+                if not verify_tickets_on_web(r["url"]):
+                    logger.info(f"⚠️ Doppia verifica fallita per {r['url']}: la pagina web dice Sales ended/Esaurito. Skip notifica.")
+                    curr_avail = False
+                else:
+                    dt = ""
                     try:
-                        await context.bot.send_message(
-                            chat_id=sub, 
-                            text=msg, 
-                            parse_mode="Markdown",
-                            disable_web_page_preview=True
-                        )
-                    except Exception as e:
-                        logger.error(f"Errore notifica a {sub}: {e}")
+                        dt_obj = datetime.fromisoformat(r["start"])
+                        dt = dt_obj.strftime("%d/%m/%Y %H:%M")
+                    except:
+                        dt = r["start"]
+                        
+                    msg = (
+                        f"🎉 *Nuovi posti disponibili!*\n\n"
+                        f"🔹 *{m_data['name']}*\n"
+                        f"📅 Data: {dt}\n\n"
+                        f"👉 [Prenota Subito]({r['url']})"
+                    )
+                    
+                    for sub in m_data["subscribers"]:
+                        try:
+                            await context.bot.send_message(
+                                chat_id=sub, 
+                                text=msg, 
+                                parse_mode="Markdown",
+                                disable_web_page_preview=True
+                            )
+                        except Exception as e:
+                            logger.error(f"Errore notifica a {sub}: {e}")
                         
             # Aggiorniamo stato
             if cid not in states or states[cid].get("available") != curr_avail:
@@ -541,7 +595,7 @@ def main():
     if not CONFIG_FILE.exists():
         print("❌ File config.json non trovato!")
         print("Crealo inserendo:")
-        print('{\n  "telegram_bot_token": "IL_TUO_TOKEN_QUI",\n  "check_interval_hours": 4\n}')
+        print('{\n  "telegram_bot_token": "IL_TUO_TOKEN_QUI",\n  "check_interval_minutes": 15\n}')
         return
         
     with open(CONFIG_FILE, "r") as f:
@@ -562,9 +616,13 @@ def main():
     # Ascolta qualsiasi messaggio di testo per link
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    # Eventbrite: check ogni N ore
-    interval_hours = config.get("check_interval_hours", 4)
-    interval_seconds = interval_hours * 3600
+    # Eventbrite: check intervallo in minuti o ore
+    if "check_interval_minutes" in config:
+        interval_seconds = config["check_interval_minutes"] * 60
+    elif "check_interval_hours" in config:
+        interval_seconds = config["check_interval_hours"] * 3600
+    else:
+        interval_seconds = 15 * 60
     
     job_queue = application.job_queue
     # Partiamo in ritardo di 10 secondi, e poi cicliamo
@@ -578,3 +636,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

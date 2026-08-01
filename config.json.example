@@ -1,4 +1,4 @@
 {
   "telegram_bot_token": "IL_TUO_TOKEN_QUI",
-  "check_interval_hours": 4
+  "check_interval_minutes": 15
 }
