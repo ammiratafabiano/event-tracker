@@ -33,8 +33,19 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 EVENTBRITE_DOMAINS = {"eventbrite.it", "eventbrite.com", "www.eventbrite.it", "www.eventbrite.com"}
+IMAX_DOMAINS = {"imax.com", "www.imax.com"}
 
 PAGE_CHECK_INTERVAL = 15 * 60  # ogni 15 minuti
+IMAX_CHECK_INTERVAL = 10 * 60  # ogni 10 minuti
+
+# Algolia API details for IMAX
+ALGOLIA_URL = "https://10mxkgb0uh-dsn.algolia.net/1/indexes/dev_web23_showtimes/query"
+ALGOLIA_HEADERS = {
+    "x-algolia-api-key": "7c9c8e2eadbdc26fb3b97b5db64a28dd",
+    "x-algolia-application-id": "10MXKGB0UH",
+    "Content-Type": "application/json",
+    "User-Agent": USER_AGENT,
+}
 
 # Sessioni HTTP riutilizzate tra le chiamate (evita overhead TLS/handshake)
 _http_session: Optional[requests.Session] = None
@@ -103,9 +114,10 @@ def _make_page_watcher_id(url: str) -> str:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     welcome_text = (
         "👋 Ciao! Sono Event Tracker.\n\n"
-        "Posso monitorare per te pagine web e biglietti Eventbrite!\n\n"
+        "Posso monitorare per te pagine web, biglietti Eventbrite e showtimes IMAX!\n\n"
         "📌 *Comandi disponibili:*\n"
         "Invia un *link Eventbrite* → monitoraggio posti liberi.\n"
+        "Invia un *link IMAX* → monitoraggio showtimes e nuove date.\n"
         "Invia un *qualsiasi altro link* → ti avviso quando la pagina cambia.\n"
         "/list - Mostra i tuoi monitoraggi e permette di rimuoverli."
     )
@@ -127,7 +139,12 @@ async def list_monitors(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     text = "📋 *I tuoi monitoraggi:*\n\n"
     for mid, m_data in user_monitors:
         platform = m_data.get("platform", "eventbrite")
-        icon = "🌐" if platform == "page_watcher" else "🎫"
+        if platform == "page_watcher":
+            icon = "🌐"
+        elif platform == "imax":
+            icon = "🎬"
+        else:
+            icon = "🎫"
         text += f"{icon} *{m_data['name']}*\n"
         text += f"🔗 [Link]({m_data['url']})\n"
         text += f"❌ Rimuovi: /remove\\_{mid}\n\n"
@@ -190,6 +207,42 @@ def _is_eventbrite_url(url: str) -> bool:
     except Exception:
         return False
 
+def _is_imax_url(url: str) -> bool:
+    try:
+        host = urlparse(url).hostname or ""
+        return any(d in host for d in IMAX_DOMAINS)
+    except Exception:
+        return False
+
+def check_imax_odyssey_showtimes(slug: str = "amc-lincoln-square-13-imax") -> Dict[str, List[str]]:
+    """Consulta l'API Algolia di IMAX e restituisce un dizionario { 'YYYY-MM-DD': ['HH:MM', ...] }."""
+    try:
+        session = _get_http_session()
+        data = {"query": slug, "page": 0}
+        resp = session.post(ALGOLIA_URL, headers=ALGOLIA_HEADERS, json=data, timeout=15)
+        resp.raise_for_status()
+        result = resp.json()
+
+        showtimes_by_date = {}
+        for hit in result.get("hits", []):
+            if hit.get("slug") == slug:
+                for ev in hit.get("events", []):
+                    movie_name = ev.get("movie", {}).get("name", "")
+                    if "odyssey" in movie_name.lower():
+                        st_dict = ev.get("showtimes", {})
+                        for d_key, d_val in st_dict.items():
+                            try:
+                                formatted_date = f"{d_key[:4]}-{d_key[4:6]}-{d_key[6:]}"
+                            except Exception:
+                                formatted_date = d_key
+                            times = list(d_val.get("showtimes", {}).keys())
+                            times.sort()
+                            showtimes_by_date[formatted_date] = times
+        return showtimes_by_date
+    except Exception as e:
+        logger.error(f"Errore controllo IMAX Algolia per {slug}: {e}")
+        return {}
+
 def _extract_url(text: str) -> Optional[str]:
     """Estrae il primo URL http/https dal testo."""
     m = re.search(r'https?://\S+', text)
@@ -206,8 +259,49 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if _is_eventbrite_url(url):
         await _handle_eventbrite(update, context, url, chat_id)
+    elif _is_imax_url(url):
+        await _handle_imax(update, context, url, chat_id)
     else:
         await _handle_page_watcher(update, context, url, chat_id)
+
+
+async def _handle_imax(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, chat_id: int) -> None:
+    """Aggiunge un monitoraggio IMAX per AMC Lincoln Square 13 / The Odyssey."""
+    await update.message.reply_text("🔍 Recupero showtimes IMAX in corso...")
+
+    showtimes = check_imax_odyssey_showtimes("amc-lincoln-square-13-imax")
+    mid = "imax_amc_lincoln_square_13"
+
+    db = load_db()
+    if mid not in db["monitors"]:
+        db["monitors"][mid] = {
+            "url": url,
+            "platform": "imax",
+            "name": "IMAX AMC Lincoln Square 13 (The Odyssey)",
+            "subscribers": [chat_id],
+            "showtimes_state": showtimes,
+        }
+    else:
+        if chat_id not in db["monitors"][mid]["subscribers"]:
+            db["monitors"][mid]["subscribers"].append(chat_id)
+        else:
+            await update.message.reply_text(
+                "ℹ️ Stai già monitorando *IMAX AMC Lincoln Square 13 (The Odyssey)*.\n"
+                "Usa /list per gestire i tuoi monitoraggi.",
+                parse_mode="Markdown"
+            )
+            return
+
+    save_db(db)
+
+    msg = (
+        "✅ *Monitoraggio IMAX Attivato!*\n\n"
+        "🎬 *AMC Lincoln Square 13 - The Odyssey (IMAX 70mm)*\n"
+        f"📅 Date attuali rilevate: {len(showtimes)}\n\n"
+        "🎯 Ti avviserò immediatamente non appena verranno pubblicate *nuove date o nuovi orari* "
+        "(con priorità per il periodo dal 21 al 29 Agosto, e in particolare il 29 Agosto alle 06:00/18:00!)."
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 
 async def _handle_page_watcher(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, chat_id: int) -> None:
@@ -588,6 +682,88 @@ async def bg_check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         
     logger.info("Controllo Eventbrite terminato.")
 
+async def bg_imax_watch_check(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Controllo periodico showtimes IMAX 24/7."""
+    logger.info("Avvio controllo IMAX schedulato...")
+    db = load_db()
+    modifications = False
+
+    for mid, m_data in dict(db["monitors"]).items():
+        if m_data.get("platform") != "imax":
+            continue
+        if not m_data.get("subscribers"):
+            continue
+
+        slug = "amc-lincoln-square-13-imax"
+        curr_showtimes = check_imax_odyssey_showtimes(slug)
+        if not curr_showtimes:
+            continue
+
+        prev_showtimes = m_data.get("showtimes_state", {})
+
+        new_dates_added = []
+        new_slots_added = []
+
+        for d_str, times in curr_showtimes.items():
+            if d_str not in prev_showtimes:
+                new_dates_added.append((d_str, times))
+            else:
+                prev_times = set(prev_showtimes[d_str])
+                for t in times:
+                    if t not in prev_times:
+                        new_slots_added.append((d_str, t))
+
+        if new_dates_added or new_slots_added:
+            logger.info(f"🔔 Trovate nuove date/orari IMAX per {m_data['name']}!")
+            m_data["showtimes_state"] = curr_showtimes
+            modifications = True
+
+            msg = "🎬 *IMAX - Nuovi Slot / Date per The Odyssey!*\n"
+            msg += f"📍 *AMC Lincoln Square 13*\n\n"
+
+            if new_dates_added:
+                msg += "📅 *Nuove date aggiunte:*\n"
+                for d_str, times in new_dates_added:
+                    is_target_range = ("2026-08-21" <= d_str <= "2026-08-29")
+                    badge = "⚡ PRIORITÀ" if is_target_range else ""
+                    msg += f"  • *{d_str}*: {', '.join(times)} {badge}\n"
+                msg += "\n"
+
+            if new_slots_added:
+                msg += "⏰ *Nuovi orari aggiunti:*\n"
+                for d_str, t in new_slots_added:
+                    is_target_slot = ("2026-08-21" <= d_str <= "2026-08-29")
+                    is_special_target = (d_str == "2026-08-29" and t in ["06:00", "18:00"])
+                    if is_special_target:
+                        badge = "🔥 TOP PRIORITÀ (29 Ago)!"
+                    elif is_target_slot:
+                        badge = "⚡ PRIORITÀ"
+                    else:
+                        badge = ""
+                    msg += f"  • *{d_str}* alle *{t}* {badge}\n"
+                msg += "\n"
+
+            msg += f"👉 [Prenota su IMAX.com]({m_data['url']})"
+
+            for sub in m_data["subscribers"]:
+                try:
+                    await context.bot.send_message(
+                        chat_id=sub,
+                        text=msg,
+                        parse_mode="Markdown",
+                        disable_web_page_preview=True
+                    )
+                except Exception as e:
+                    logger.error(f"Errore notifica IMAX a {sub}: {e}")
+
+        await asyncio.sleep(2)
+
+    if modifications:
+        save_db(db)
+
+    logger.info("Controllo IMAX terminato.")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -631,6 +807,9 @@ def main():
     # Page watchers: check ogni 15 minuti
     job_queue.run_repeating(bg_page_watch_check, interval=PAGE_CHECK_INTERVAL, first=30)
     
+    # IMAX showtimes: check 24/7 ogni 10 minuti
+    job_queue.run_repeating(bg_imax_watch_check, interval=IMAX_CHECK_INTERVAL, first=15)
+
     logger.info("🤖 Event Tracker Bot avviato. In attesa di messaggi...")
     application.run_polling()
 
