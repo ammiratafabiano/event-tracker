@@ -492,41 +492,43 @@ def verify_tickets_on_web(url: str) -> bool:
 
 # -- Page watcher hash check --
 
-def clean_page_content(html: str) -> str:
-    """Rimuove dall'HTML tutti gli elementi tecnici/dinamici che variano tra richieste successive."""
-    # Rimuovi head (meta tag, csrf, preload, analytics)
-    html = re.sub(r'<head[^>]*>.*?</head>', '', html, flags=re.DOTALL | re.IGNORECASE)
-    # Rimuovi script, style, noscript, svg, iframe
-    html = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
-    html = re.sub(r'<style[^>]*>.*?</style>', '', html, flags=re.DOTALL | re.IGNORECASE)
-    html = re.sub(r'<noscript[^>]*>.*?</noscript>', '', html, flags=re.DOTALL | re.IGNORECASE)
-    html = re.sub(r'<svg[^>]*>.*?</svg>', '', html, flags=re.DOTALL | re.IGNORECASE)
-    html = re.sub(r'<iframe[^>]*>.*?</iframe>', '', html, flags=re.DOTALL | re.IGNORECASE)
-    html = re.sub(r'<!--.*?-->', '', html, flags=re.DOTALL)
+def extract_visible_text(html: str) -> str:
+    """Estrae il testo visibile della pagina, scartando script, stile, header, footer,
+    banner promozionali, caroselli, pop-up e sezioni di raccomandazione prodotti."""
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "html.parser")
 
-    # Rimuovi tutti i tag input (campi form, CSRF token, store locator, zip code, ecc.)
-    html = re.sub(r'<input[^>]*>', '', html, flags=re.IGNORECASE)
+        # Rimuovi elementi tecnici e di navigazione
+        for tag in soup(["head", "script", "style", "noscript", "svg", "iframe", "header", "footer", "nav", "aside"]):
+            tag.decompose()
 
-    # Rimuovi attributi dinamici generati da server/framework (nonce, csrf, timestamps, token, request-id)
-    html = re.sub(
-        r'\s(?:nonce|data-nonce|csrf|data-csrf|data-timestamp|data-generatedtime|data-request-id)=[\'"][^\'"]*[\'"]',
-        '',
-        html,
-        flags=re.IGNORECASE
-    )
+        # Rimuovi tutti i form e campi input
+        for inp in soup.find_all(["input", "form", "select", "textarea"]):
+            inp.decompose()
 
-    # Normalizza gli spazi
-    html = re.sub(r'\s+', ' ', html).strip()
-    return html
+        # Rimuovi elementi promozionali, banner, caroselli, slider, popup e raccomandazioni
+        for el in soup.find_all(class_=re.compile(r"recommend|carousel|slider|banner|modal|popup|breadcrumb", re.I)):
+            el.decompose()
+
+        text = soup.get_text(separator=" ", strip=True)
+        return re.sub(r"\s+", " ", text).strip()
+    except Exception as e:
+        logger.error(f"Errore estrazione testo visibile: {e}")
+        # Fallback con regex
+        html = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
+        html = re.sub(r'<style[^>]*>.*?</style>', '', html, flags=re.DOTALL | re.IGNORECASE)
+        html = re.sub(r'<[^>]+>', ' ', html)
+        return re.sub(r'\s+', ' ', html).strip()
 
 def get_page_hash(url: str) -> Optional[str]:
-    """Fetch una pagina web e ritorna un hash del contenuto principale ripulito."""
+    """Fetch una pagina web e ritorna un hash del testo visibile effettivo."""
     try:
         session = _get_http_session()
         resp = session.get(url, timeout=20)
         resp.raise_for_status()
-        cleaned = clean_page_content(resp.text)
-        return hashlib.sha256(cleaned.encode('utf-8')).hexdigest()
+        text = extract_visible_text(resp.text)
+        return hashlib.sha256(text.encode('utf-8')).hexdigest()
     except Exception as e:
         logger.error(f"Errore controllo pagina {url}: {e}")
         return None
