@@ -11,9 +11,10 @@ from typing import Dict, Any, List, Optional
 from urllib.parse import urlparse
 
 import requests
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -34,7 +35,53 @@ USER_AGENT = (
 )
 EVENTBRITE_DOMAINS = {"eventbrite.it", "eventbrite.com", "www.eventbrite.it", "www.eventbrite.com"}
 
-PAGE_CHECK_INTERVAL = 15 * 60  # ogni 15 minuti
+def get_frequency_presets() -> Dict[str, Dict[str, Any]]:
+    presets = {
+        "fast": {"label": "⚡ Veloce (5m)", "minutes": 5},
+        "normal": {"label": "⏱️ Normale (15m)", "minutes": 15},
+        "slow": {"label": "🐢 Lento (2h)", "minutes": 120},
+        "daily": {"label": "💤 Giornaliero (24h)", "minutes": 1440},
+    }
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                cfg = json.load(f)
+                if "check_interval_minutes" in cfg:
+                    mins = int(cfg["check_interval_minutes"])
+                    presets["normal"]["minutes"] = mins
+                    presets["normal"]["label"] = f"⏱️ Normale ({mins}m)"
+                elif "check_interval_hours" in cfg:
+                    hours = cfg["check_interval_hours"]
+                    presets["normal"]["minutes"] = int(hours * 60)
+                    presets["normal"]["label"] = f"⏱️ Normale ({hours}h)"
+
+                custom = cfg.get("frequency_presets_minutes", {})
+                for k, mins in custom.items():
+                    if k in presets and isinstance(mins, (int, float)) and mins > 0:
+                        presets[k]["minutes"] = int(mins)
+        except Exception as e:
+            logger.warning(f"Errore lettura preset da config.json: {e}")
+    return presets
+
+def get_frequency_keyboard(mid: str, current_freq: str = "normal") -> InlineKeyboardMarkup:
+    presets = get_frequency_presets()
+    buttons = []
+    row = []
+    for key, pinfo in presets.items():
+        text = pinfo["label"]
+        if key == current_freq:
+            text = f"✅ {text}"
+        row.append(InlineKeyboardButton(text=text, callback_data=f"setfreq:{mid}:{key}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    return InlineKeyboardMarkup(buttons)
+
+def is_night_time() -> bool:
+    now = datetime.now()
+    return now.hour >= 23 or now.hour < 7
 
 # Sessioni HTTP riutilizzate tra le chiamate (evita overhead TLS/handshake)
 _http_session: Optional[requests.Session] = None
@@ -85,6 +132,20 @@ def load_db() -> Dict[str, Any]:
         if key.startswith("prada_") or key.startswith("page_watch_"):
             db.pop(key)
             migrated = True
+
+    presets = get_frequency_presets()
+    default_mins = presets["normal"]["minutes"]
+    for mid, m_data in db["monitors"].items():
+        if "frequency" not in m_data:
+            m_data["frequency"] = "normal"
+            migrated = True
+        if "interval_minutes" not in m_data:
+            m_data["interval_minutes"] = presets.get(m_data["frequency"], {}).get("minutes", default_mins)
+            migrated = True
+        if "last_checked" not in m_data:
+            m_data["last_checked"] = 0
+            migrated = True
+
     if migrated:
         save_db(db)
     return db
@@ -107,13 +168,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "📌 *Comandi disponibili:*\n"
         "Invia un *link Eventbrite* → monitoraggio posti liberi.\n"
         "Invia un *qualsiasi altro link* → ti avviso quando la pagina cambia.\n"
-        "/list - Mostra i tuoi monitoraggi e permette di rimuoverli."
+        "/list - Mostra i tuoi monitoraggi e permette di gestirli (cambio frequenza e rimozione)."
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
 
 async def list_monitors(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     db = load_db()
+    presets = get_frequency_presets()
 
     user_monitors = []
     for mid, m_data in db["monitors"].items():
@@ -128,8 +190,12 @@ async def list_monitors(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     for mid, m_data in user_monitors:
         platform = m_data.get("platform", "eventbrite")
         icon = "🌐" if platform == "page_watcher" else "🎫"
+        freq_key = m_data.get("frequency", "normal")
+        freq_label = presets.get(freq_key, {}).get("label", f"{m_data.get('interval_minutes', 15)}m")
         text += f"{icon} *{m_data['name']}*\n"
         text += f"🔗 [Link]({m_data['url']})\n"
+        text += f"⏱ Frequenza: {freq_label}\n"
+        text += f"⚙️ Cambia frequenza: /freq\\_{mid}\n"
         text += f"❌ Rimuovi: /remove\\_{mid}\n\n"
 
     await update.message.reply_text(text, parse_mode="Markdown", disable_web_page_preview=True)
@@ -159,26 +225,104 @@ async def remove_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     save_db(db)
     await update.message.reply_text(f"✅ Monitoraggio rimosso per: *{name}*", parse_mode="Markdown")
 
+async def change_frequency_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    command_text = update.message.text
+    match = re.search(r'/freq_(\w+)', command_text)
+
+    if not match:
+        await update.message.reply_text("⚠️ Comando non valido. Usa /list per vedere i tuoi monitoraggi.")
+        return
+
+    target_id = match.group(1)
+    db = load_db()
+
+    if target_id not in db["monitors"] or chat_id not in db["monitors"][target_id].get("subscribers", []):
+        await update.message.reply_text("❌ Non stai monitorando questo ID. Usa /list per vedere i tuoi monitoraggi.")
+        return
+
+    m_data = db["monitors"][target_id]
+    current_freq = m_data.get("frequency", "normal")
+    keyboard = get_frequency_keyboard(target_id, current_freq)
+
+    await update.message.reply_text(
+        f"⚙️ Imposta la frequenza per: *{m_data['name']}*",
+        parse_mode="Markdown",
+        reply_markup=keyboard
+    )
+
+async def handle_frequency_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data or ""
+    parts = data.split(":")
+    if len(parts) != 3 or parts[0] != "setfreq":
+        return
+
+    mid = parts[1]
+    new_freq = parts[2]
+    chat_id = update.effective_chat.id
+
+    presets = get_frequency_presets()
+    if new_freq not in presets:
+        return
+
+    db = load_db()
+    if mid not in db["monitors"] or chat_id not in db["monitors"][mid].get("subscribers", []):
+        try:
+            await query.edit_message_text("❌ Monitoraggio non trovato o non più attivo.")
+        except Exception:
+            pass
+        return
+
+    m_data = db["monitors"][mid]
+    m_data["frequency"] = new_freq
+    m_data["interval_minutes"] = presets[new_freq]["minutes"]
+    save_db(db)
+
+    selected_label = presets[new_freq]["label"]
+    new_keyboard = get_frequency_keyboard(mid, new_freq)
+
+    text = query.message.text or ""
+    base_text = text.split("\n\n✅ Frequenza aggiornata")[0]
+    updated_text = f"{base_text}\n\n✅ Frequenza aggiornata: *{selected_label}*"
+
+    try:
+        await query.edit_message_text(
+            text=updated_text,
+            parse_mode="Markdown",
+            reply_markup=new_keyboard,
+            disable_web_page_preview=True
+        )
+    except Exception as e:
+        logger.debug(f"Errore aggiornamento messaggio callback: {e}")
+
 
 # ---------------------------------------------------------------------------
 # Page Watcher helpers
 # ---------------------------------------------------------------------------
-def _add_page_watcher(db: Dict, chat_id: int, url: str, name: str) -> str:
-    """Aggiunge o iscrive l'utente a un page watcher. Ritorna 'added' o 'exists'."""
+def _add_page_watcher(db: Dict, chat_id: int, url: str, name: str) -> tuple[str, str]:
+    """Aggiunge o iscrive l'utente a un page watcher. Ritorna (risultato, mid)."""
     mid = _make_page_watcher_id(url)
+    presets = get_frequency_presets()
+    interval = presets["normal"]["minutes"]
     if mid not in db["monitors"]:
         db["monitors"][mid] = {
             "url": url,
             "platform": "page_watcher",
             "name": name,
             "subscribers": [chat_id],
+            "frequency": "normal",
+            "interval_minutes": interval,
+            "last_checked": 0,
         }
-        return "added"
+        return "added", mid
     else:
         if chat_id not in db["monitors"][mid]["subscribers"]:
             db["monitors"][mid]["subscribers"].append(chat_id)
-            return "added"
-        return "exists"
+            return "added", mid
+        return "exists", mid
 
 # ---------------------------------------------------------------------------
 # Handle incoming messages (links)
@@ -216,22 +360,28 @@ async def _handle_page_watcher(update: Update, context: ContextTypes.DEFAULT_TYP
     name = parsed.hostname or url[:50]
 
     db = load_db()
-    result = _add_page_watcher(db, chat_id, url, name)
+    result, mid = _add_page_watcher(db, chat_id, url, name)
     save_db(db)
+
+    current_freq = db["monitors"][mid].get("frequency", "normal")
+    keyboard = get_frequency_keyboard(mid, current_freq)
 
     if result == "exists":
         await update.message.reply_text(
-            "ℹ️ Stai già monitorando questa pagina.\n"
-            "Usa /list per gestire i tuoi monitoraggi.",
-            parse_mode="Markdown"
+            f"ℹ️ Stai già monitorando questa pagina: *{name}*.\n\n"
+            "⏱ *Puoi cambiare la frequenza qui sotto:*",
+            parse_mode="Markdown",
+            reply_markup=keyboard,
+            disable_web_page_preview=True
         )
     else:
         await update.message.reply_text(
             f"✅ Monitoraggio attivato!\n\n"
             f"🌐 *{name}*\n"
             "Ti avviserò quando la pagina viene modificata.\n\n"
-            "Usa /list per gestire i tuoi monitoraggi.",
+            "⏱ *Seleziona la frequenza di controllo:*",
             parse_mode="Markdown",
+            reply_markup=keyboard,
             disable_web_page_preview=True
         )
 
@@ -263,22 +413,28 @@ async def _handle_eventbrite(update: Update, context: ContextTypes.DEFAULT_TYPE,
         db = load_db()
 
         if event_id not in db["monitors"]:
+            presets = get_frequency_presets()
             db["monitors"][event_id] = {
                 "url": url,
                 "platform": "eventbrite",
                 "name": name,
                 "is_series": is_series,
                 "subscribers": [chat_id],
-                "events_state": {}
+                "events_state": {},
+                "frequency": "normal",
+                "interval_minutes": presets["normal"]["minutes"],
+                "last_checked": 0,
             }
         else:
             if chat_id not in db["monitors"][event_id]["subscribers"]:
                 db["monitors"][event_id]["subscribers"].append(chat_id)
             else:
+                keyboard = get_frequency_keyboard(event_id, db["monitors"][event_id].get("frequency", "normal"))
                 await update.message.reply_text(
-                    f"ℹ️ Stai già monitorando *{name}*.\n"
-                    "Usa /list per gestire i tuoi monitoraggi.",
-                    parse_mode="Markdown"
+                    f"ℹ️ Stai già monitorando *{name}*.\n\n"
+                    "⏱ *Puoi cambiare la frequenza qui sotto o usare /list per gestire i monitoraggi:*",
+                    parse_mode="Markdown",
+                    reply_markup=keyboard
                 )
                 return
 
@@ -286,11 +442,13 @@ async def _handle_eventbrite(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
         msg = f"✅ Aggiunto con successo!\n\nSto monitorando: *{name}*\n"
         if is_series:
-            msg += "Questo è un evento ricorrente, controllerò tutte le date future in cerca di disdette e posti liberi."
+            msg += "Questo è un evento ricorrente, controllerò tutte le date future in cerca di disdette e posti liberi.\n\n"
         else:
-            msg += "Questo è un evento singolo, ti avviserò se tornano posti."
+            msg += "Questo è un evento singolo, ti avviserò se tornano posti.\n\n"
+        msg += "⏱ *Seleziona la frequenza di controllo:*"
 
-        await update.message.reply_text(msg, parse_mode="Markdown")
+        keyboard = get_frequency_keyboard(event_id, "normal")
+        await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=keyboard)
 
     except Exception as e:
         logger.error(f"Errore durante l'aggiunta dell'evento: {e}")
@@ -334,85 +492,84 @@ def verify_tickets_on_web(url: str) -> bool:
 
 # -- Page watcher hash check --
 
+def clean_page_content(html: str) -> str:
+    """Rimuove dall'HTML tutti gli elementi tecnici/dinamici che variano tra richieste successive."""
+    # Rimuovi head (meta tag, csrf, preload, analytics)
+    html = re.sub(r'<head[^>]*>.*?</head>', '', html, flags=re.DOTALL | re.IGNORECASE)
+    # Rimuovi script, style, noscript, svg, iframe
+    html = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
+    html = re.sub(r'<style[^>]*>.*?</style>', '', html, flags=re.DOTALL | re.IGNORECASE)
+    html = re.sub(r'<noscript[^>]*>.*?</noscript>', '', html, flags=re.DOTALL | re.IGNORECASE)
+    html = re.sub(r'<svg[^>]*>.*?</svg>', '', html, flags=re.DOTALL | re.IGNORECASE)
+    html = re.sub(r'<iframe[^>]*>.*?</iframe>', '', html, flags=re.DOTALL | re.IGNORECASE)
+    html = re.sub(r'<!--.*?-->', '', html, flags=re.DOTALL)
+
+    # Rimuovi tutti i tag input (campi form, CSRF token, store locator, zip code, ecc.)
+    html = re.sub(r'<input[^>]*>', '', html, flags=re.IGNORECASE)
+
+    # Rimuovi attributi dinamici generati da server/framework (nonce, csrf, timestamps, token, request-id)
+    html = re.sub(
+        r'\s(?:nonce|data-nonce|csrf|data-csrf|data-timestamp|data-generatedtime|data-request-id)=[\'"][^\'"]*[\'"]',
+        '',
+        html,
+        flags=re.IGNORECASE
+    )
+
+    # Normalizza gli spazi
+    html = re.sub(r'\s+', ' ', html).strip()
+    return html
+
 def get_page_hash(url: str) -> Optional[str]:
-    """Fetch una pagina web e ritorna un hash del contenuto principale."""
+    """Fetch una pagina web e ritorna un hash del contenuto principale ripulito."""
     try:
         session = _get_http_session()
         resp = session.get(url, timeout=20)
         resp.raise_for_status()
-        html = resp.text
-
-        # Rimuovi parti dinamiche che cambiano ad ogni request
-        html = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL)
-        html = re.sub(r'<style[^>]*>.*?</style>', '', html, flags=re.DOTALL)
-        html = re.sub(r'<!--.*?-->', '', html, flags=re.DOTALL)
-        html = re.sub(r'\s(?:nonce|data-nonce|csrf|data-timestamp)=["\'][^"\']*["\']', '', html)
-        html = re.sub(r'\s+', ' ', html).strip()
-
-        return hashlib.sha256(html.encode('utf-8')).hexdigest()
+        cleaned = clean_page_content(resp.text)
+        return hashlib.sha256(cleaned.encode('utf-8')).hexdigest()
     except Exception as e:
         logger.error(f"Errore controllo pagina {url}: {e}")
         return None
 
 
-async def bg_page_watch_check(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Controllo periodico di tutti i page watcher in monitors."""
-    now = datetime.now()
+async def check_single_page_watcher(context: ContextTypes.DEFAULT_TYPE, mid: str, m_data: Dict[str, Any]) -> bool:
+    """Controllo di un singolo page watcher. Ritorna True se ci sono modifiche da salvare nel DB."""
+    url = m_data["url"]
+    name = m_data["name"]
+    logger.info(f"Controllo pagina {name} ({url[:60]})...")
 
-    if now.hour >= 23 or now.hour < 7:
-        logger.info("Page watchers: orario notturno, skip.")
-        return
+    current_hash = get_page_hash(url)
+    if current_hash is None:
+        return False
 
-    db = load_db()
-    modifications = False
+    prev_hash = m_data.get("page_hash")
+    if prev_hash is None:
+        m_data["page_hash"] = current_hash
+        logger.info(f"{name}: hash iniziale salvato ({current_hash[:12]}…)")
+        return True
 
-    for mid, m_data in dict(db["monitors"]).items():
-        if m_data.get("platform") != "page_watcher":
-            continue
-        if not m_data.get("subscribers"):
-            continue
+    if current_hash != prev_hash:
+        logger.info(f"🔔 Pagina {name} modificata! ({prev_hash[:12]}… → {current_hash[:12]}…)")
+        m_data["page_hash"] = current_hash
 
-        url = m_data["url"]
-        name = m_data["name"]
-        logger.info(f"Controllo pagina {name} ({url[:60]})...")
-
-        current_hash = get_page_hash(url)
-        if current_hash is None:
-            continue
-
-        prev_hash = m_data.get("page_hash")
-        if prev_hash is None:
-            m_data["page_hash"] = current_hash
-            modifications = True
-            logger.info(f"{name}: hash iniziale salvato ({current_hash[:12]}…)")
-            continue
-
-        if current_hash != prev_hash:
-            logger.info(f"🔔 Pagina {name} modificata! ({prev_hash[:12]}… → {current_hash[:12]}…)")
-            m_data["page_hash"] = current_hash
-            modifications = True
-
-            msg = (
-                f"🔔 *La pagina {name} è stata aggiornata!*\n\n"
-                f"👉 [Vai alla pagina]({url})"
-            )
-            for sub in m_data["subscribers"]:
-                try:
-                    await context.bot.send_message(
-                        chat_id=sub,
-                        text=msg,
-                        parse_mode="Markdown",
-                        disable_web_page_preview=True
-                    )
-                except Exception as e:
-                    logger.error(f"Errore notifica {name} a {sub}: {e}")
-        else:
-            logger.info(f"{name}: nessuna modifica.")
-
-        await asyncio.sleep(2)
-
-    if modifications:
-        save_db(db)
+        msg = (
+            f"🔔 *La pagina {name} è stata aggiornata!*\n\n"
+            f"👉 [Vai alla pagina]({url})"
+        )
+        for sub in m_data.get("subscribers", []):
+            try:
+                await context.bot.send_message(
+                    chat_id=sub,
+                    text=msg,
+                    parse_mode="Markdown",
+                    disable_web_page_preview=True
+                )
+            except Exception as e:
+                logger.error(f"Errore notifica {name} a {sub}: {e}")
+        return True
+    else:
+        logger.info(f"{name}: nessuna modifica.")
+        return False
 
 
 # -- Eventbrite monitors --
@@ -501,92 +658,109 @@ def check_single_event(event_id: str) -> List[Dict]:
         logger.error(f"Errore controllo evento {event_id}: {e}")
         return []
 
-async def bg_check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    now = datetime.now()
-    
-    # Orari notturni (es. dalle 22:00 alle 07:00 incluse) non controlliamo
-    if now.hour >= 22 or now.hour <= 7:
-        logger.info("Skip controllo: orario notturno.")
+async def check_single_eventbrite(context: ContextTypes.DEFAULT_TYPE, mid: str, m_data: Dict[str, Any]) -> bool:
+    """Controlla un evento o serie Eventbrite. Ritorna True se ci sono modifiche di stato da salvare."""
+    logger.info(f"Controllo Eventbrite: {m_data['name']} ({mid})")
+
+    if m_data.get("is_series", False):
+        results = check_event_series(mid)
+    else:
+        results = check_single_event(mid)
+
+    states = m_data.get("events_state", {})
+    modifications = False
+
+    for r in results:
+        cid = r["id"]
+        curr_avail = r["is_available"]
+        prev_avail = states.get(cid, {}).get("available", None)
+
+        if curr_avail is True and prev_avail is False:
+            logger.info(f"🔔 Cambio di stato per {m_data['name']}! Data: {r['start']} - Effettuo doppia verifica web...")
+            if not verify_tickets_on_web(r["url"]):
+                logger.info(f"⚠️ Doppia verifica fallita per {r['url']}: la pagina web dice Sales ended/Esaurito. Skip notifica.")
+                curr_avail = False
+            else:
+                dt = ""
+                try:
+                    dt_obj = datetime.fromisoformat(r["start"])
+                    dt = dt_obj.strftime("%d/%m/%Y %H:%M")
+                except Exception:
+                    dt = r["start"]
+
+                msg = (
+                    f"🎉 *Nuovi posti disponibili!*\n\n"
+                    f"🔹 *{m_data['name']}*\n"
+                    f"📅 Data: {dt}\n\n"
+                    f"👉 [Prenota Subito]({r['url']})"
+                )
+
+                for sub in m_data.get("subscribers", []):
+                    try:
+                        await context.bot.send_message(
+                            chat_id=sub,
+                            text=msg,
+                            parse_mode="Markdown",
+                            disable_web_page_preview=True
+                        )
+                    except Exception as e:
+                        logger.error(f"Errore notifica a {sub}: {e}")
+
+        if cid not in states or states[cid].get("available") != curr_avail:
+            states[cid] = {
+                "available": curr_avail,
+                "url": r["url"],
+                "start": r["start"]
+            }
+            modifications = True
+
+    m_data["events_state"] = states
+    return modifications
+
+async def bg_dispatcher_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Dispatcher periodico: controlla ogni monitoraggio in base alla propria frequenza."""
+    if is_night_time():
+        logger.info("Skip controlli: orario notturno.")
         return
-        
-    logger.info("Avvio controllo Eventbrite schedulato...")
+
+    now_ts = time.time()
     db = load_db()
     modifications = False
-    
-    # Per ogni monitor
+
     for mid, m_data in dict(db["monitors"]).items():
-        if m_data.get("platform") == "page_watcher":
-            continue
         if not m_data.get("subscribers"):
             continue
-            
-        logger.info(f"Controllo: {m_data['name']} ({mid})")
-        
-        if m_data.get("is_series", False):
-            results = check_event_series(mid)
-        else:
-            results = check_single_event(mid)
-        await asyncio.sleep(3)
-            
-        # Analizziamo i risultati e mandiamo notifiche se qualcosa è tornato disponibile
-        states = m_data.get("events_state", {})
-        
-        for r in results:
-            cid = r["id"]
-            curr_avail = r["is_available"]
-            prev_avail = states.get(cid, {}).get("available", None)
-            
-            if curr_avail is True and prev_avail is False:
-                # E' diventato disponibile dall'API -> effettuiamo verfica web finale per evitare false avvisi "Sales ended"
-                logger.info(f"🔔 Cambio di stato per {m_data['name']}! Data: {r['start']} - Effettuo doppia verifica web...")
-                
-                if not verify_tickets_on_web(r["url"]):
-                    logger.info(f"⚠️ Doppia verifica fallita per {r['url']}: la pagina web dice Sales ended/Esaurito. Skip notifica.")
-                    curr_avail = False
-                else:
-                    dt = ""
-                    try:
-                        dt_obj = datetime.fromisoformat(r["start"])
-                        dt = dt_obj.strftime("%d/%m/%Y %H:%M")
-                    except:
-                        dt = r["start"]
-                        
-                    msg = (
-                        f"🎉 *Nuovi posti disponibili!*\n\n"
-                        f"🔹 *{m_data['name']}*\n"
-                        f"📅 Data: {dt}\n\n"
-                        f"👉 [Prenota Subito]({r['url']})"
-                    )
-                    
-                    for sub in m_data["subscribers"]:
-                        try:
-                            await context.bot.send_message(
-                                chat_id=sub, 
-                                text=msg, 
-                                parse_mode="Markdown",
-                                disable_web_page_preview=True
-                            )
-                        except Exception as e:
-                            logger.error(f"Errore notifica a {sub}: {e}")
-                        
-            # Aggiorniamo stato
-            if cid not in states or states[cid].get("available") != curr_avail:
-                states[cid] = {
-                    "available": curr_avail,
-                    "url": r["url"],
-                    "start": r["start"]
-                }
-                modifications = True
-                
-        m_data["events_state"] = states
-        
-        # Facciamo una piccola pausa tra le chiamate per non esagerare se abbiamo molti monitoraggi
+
+        interval_minutes = m_data.get("interval_minutes", 15)
+        interval_seconds = interval_minutes * 60
+        last_checked = m_data.get("last_checked", 0)
+
+        # Controlliamo solo se è trascorso l'intervallo previsto
+        if (now_ts - last_checked) < interval_seconds:
+            continue
+
+        platform = m_data.get("platform", "eventbrite")
+        try:
+            if platform == "page_watcher":
+                changed = await check_single_page_watcher(context, mid, m_data)
+                if changed:
+                    modifications = True
+            elif platform == "eventbrite":
+                changed = await check_single_eventbrite(context, mid, m_data)
+                if changed:
+                    modifications = True
+        except Exception as e:
+            logger.error(f"Errore durante il controllo del monitor {mid} ({m_data.get('name')}): {e}")
+
+        # Aggiorna il timestamp di ultimo controllo
+        m_data["last_checked"] = time.time()
+        modifications = True
+
+        # Breve pausa per evitare burst
         await asyncio.sleep(2)
-        
+
     if modifications:
         save_db(db)
-        
-    logger.info("Controllo Eventbrite terminato.")
 
 # ---------------------------------------------------------------------------
 # Main
@@ -595,42 +769,35 @@ def main():
     if not CONFIG_FILE.exists():
         print("❌ File config.json non trovato!")
         print("Crealo inserendo:")
-        print('{\n  "telegram_bot_token": "IL_TUO_TOKEN_QUI",\n  "check_interval_minutes": 15\n}')
+        print('{\n  "telegram_bot_token": "IL_TUO_TOKEN_QUI"\n}')
         return
-        
+
     with open(CONFIG_FILE, "r") as f:
         config = json.load(f)
-        
+
     token = config.get("telegram_bot_token", "")
     if not token or token == "IL_TUO_TOKEN_QUI":
         print("❌ Token Telegram non configurato in config.json!")
         return
-        
+
     application = Application.builder().token(token).build()
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("list", list_monitors))
     # Comandi dinamici /remove_<id>
     application.add_handler(MessageHandler(filters.Regex(r'^/remove_\w+$'), remove_monitor))
-    
+    # Comandi dinamici /freq_<id>
+    application.add_handler(MessageHandler(filters.Regex(r'^/freq_\w+$'), change_frequency_command))
+    # Callback query per bottoni di selezione frequenza
+    application.add_handler(CallbackQueryHandler(handle_frequency_callback, pattern=r'^setfreq:'))
+
     # Ascolta qualsiasi messaggio di testo per link
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    
-    # Eventbrite: check intervallo in minuti o ore
-    if "check_interval_minutes" in config:
-        interval_seconds = config["check_interval_minutes"] * 60
-    elif "check_interval_hours" in config:
-        interval_seconds = config["check_interval_hours"] * 3600
-    else:
-        interval_seconds = 15 * 60
-    
-    job_queue = application.job_queue
-    # Partiamo in ritardo di 10 secondi, e poi cicliamo
-    job_queue.run_repeating(bg_check_job, interval=interval_seconds, first=10)
 
-    # Page watchers: check ogni 15 minuti
-    job_queue.run_repeating(bg_page_watch_check, interval=PAGE_CHECK_INTERVAL, first=30)
-    
+    job_queue = application.job_queue
+    # Dispatcher unificato: controlla ogni 60 secondi quali monitoraggi devono girare
+    job_queue.run_repeating(bg_dispatcher_job, interval=60, first=10)
+
     logger.info("🤖 Event Tracker Bot avviato. In attesa di messaggi...")
     application.run_polling()
 

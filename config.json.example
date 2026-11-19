@@ -1,4 +1,10 @@
 {
   "telegram_bot_token": "IL_TUO_TOKEN_QUI",
-  "check_interval_minutes": 15
+  "check_interval_minutes": 15,
+  "frequency_presets_minutes": {
+    "fast": 5,
+    "normal": 15,
+    "slow": 120,
+    "daily": 1440
+  }
 }
